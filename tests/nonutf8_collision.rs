@@ -109,6 +109,7 @@ fn grep_args(query: &str) -> GrepArgs {
         no_follow: false,
         path: None,
         glob: None,
+        max_matches_per_file: None,
     }
 }
 

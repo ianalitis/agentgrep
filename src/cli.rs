@@ -59,6 +59,19 @@ pub struct GrepArgs {
     #[arg(long = "no-follow")]
     pub no_follow: bool,
 
+    /// Stop after this many matches per file.
+    ///
+    /// Consumers that render only the first N regions per file otherwise pay
+    /// for a full unbounded scan: `rg` reports every match and agentgrep parses
+    /// all of them before truncation happens at render time. Setting this
+    /// pushes the bound into `rg --max-count` (and an equivalent early exit on
+    /// the native path), which is where the work actually is.
+    ///
+    /// This is a per-file cap, so `total_matches` becomes a lower bound when it
+    /// is set. Leave it unset for exact counts.
+    #[arg(long = "max-count")]
+    pub max_matches_per_file: Option<usize>,
+
     /// Optional root path to search instead of the current directory.
     #[arg(long)]
     pub path: Option<String>,

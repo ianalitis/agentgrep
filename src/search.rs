@@ -179,7 +179,7 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
 
     if worker_count <= 1 || files.len() <= 8 {
         for entry in files {
-            if let Some(file_matches) = process_file(entry, &matcher) {
+            if let Some(file_matches) = process_file(entry, &matcher, args.max_matches_per_file) {
                 total_matches += file_matches.matches.len();
                 results.push(file_matches);
             }
@@ -194,7 +194,7 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
                     let mut partial = Vec::new();
                     let mut partial_total = 0;
                     for entry in chunk.iter().cloned() {
-                        if let Some(file_matches) = process_file(entry, &matcher) {
+                        if let Some(file_matches) = process_file(entry, &matcher, args.max_matches_per_file) {
                             partial_total += file_matches.matches.len();
                             partial.push(file_matches);
                         }
@@ -513,6 +513,12 @@ fn build_rg_command(root: &Path, args: &GrepArgs) -> Command {
     }
     command.arg("--no-messages");
 
+    // Push the per-file bound into rg so it stops reading a file after N
+    // matches, instead of reporting everything for the caller to discard.
+    if let Some(max_count) = args.max_matches_per_file {
+        command.arg("--max-count").arg(max_count.to_string());
+    }
+
     if args.hidden {
         command.arg("--hidden");
     }
@@ -791,7 +797,11 @@ impl RgTextField {
     }
 }
 
-fn process_file(entry: crate::workspace::FileEntry, matcher: &Matcher) -> Option<FileMatches> {
+fn process_file(
+    entry: crate::workspace::FileEntry,
+    matcher: &Matcher,
+    max_matches_per_file: Option<usize>,
+) -> Option<FileMatches> {
     let text = read_text_file(&entry.path)?;
 
     let mut matches = Vec::new();
@@ -801,6 +811,11 @@ fn process_file(entry: crate::workspace::FileEntry, matcher: &Matcher) -> Option
                 line_number: idx + 1,
                 line_text: matcher.display_line_text(line),
             });
+            // Mirror `rg --max-count`: stop scanning this file once the
+            // per-file bound is reached so both paths stay in parity.
+            if max_matches_per_file.is_some_and(|max| matches.len() >= max) {
+                break;
+            }
         }
     }
 
@@ -1101,6 +1116,7 @@ mod tests {
             path: None,
             glob: None,
             no_follow: false,
+            max_matches_per_file: None,
         }
     }
 
@@ -2044,4 +2060,89 @@ mod tests {
             assert_eq!(rg.total_files, 2, "rg glob should match both files");
         }
     }
+    /// The per-file cap must bound matches identically on the rg fast path and
+    /// the native fallback, so enabling it cannot change which engine's answer
+    /// a caller sees.
+    #[test]
+    fn max_count_bounds_matches_per_file_on_both_paths() {
+        let dir = tempdir().unwrap();
+        // 10 matches in one file, 3 in another: enough to prove the cap binds
+        // per file rather than globally.
+        fs::write(
+            dir.path().join("many.txt"),
+            "needle_cap\n".repeat(10),
+        )
+        .unwrap();
+        fs::write(dir.path().join("few.txt"), "needle_cap\n".repeat(3)).unwrap();
+
+        let mut args = grep_args("needle_cap");
+        args.max_matches_per_file = Some(2);
+
+        let rg_result = run_grep_with_rg(dir.path(), &args)
+            .expect("rg path must not error")
+            .expect("rg must be available for this test");
+        let native_result = run_grep_native(dir.path(), &args).unwrap();
+
+        // Both files still appear; each is capped at 2 matches.
+        assert_eq!(rg_result.total_files, 2);
+        assert_eq!(rg_result.total_matches, 4);
+        assert_eq!(native_result.total_files, rg_result.total_files);
+        assert_eq!(native_result.total_matches, rg_result.total_matches);
+
+        for result in [&rg_result, &native_result] {
+            for file in &result.files {
+                assert!(
+                    file.matches.len() <= 2,
+                    "{} exceeded the per-file cap: {} matches",
+                    file.path,
+                    file.matches.len()
+                );
+            }
+        }
+    }
+
+    /// Leaving the cap unset must preserve exact, uncapped counts.
+    #[test]
+    fn max_count_unset_preserves_exact_totals() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("many.txt"), "needle_exact\n".repeat(10)).unwrap();
+
+        let args = grep_args("needle_exact");
+        assert_eq!(args.max_matches_per_file, None, "cap must default to off");
+
+        let rg_result = run_grep_with_rg(dir.path(), &args)
+            .expect("rg path must not error")
+            .expect("rg must be available for this test");
+        let native_result = run_grep_native(dir.path(), &args).unwrap();
+
+        assert_eq!(rg_result.total_matches, 10);
+        assert_eq!(native_result.total_matches, 10);
+    }
+
+    /// The cap keeps the earliest matches in a file, so bounded output remains
+    /// a stable prefix of unbounded output rather than an arbitrary subset.
+    #[test]
+    fn max_count_keeps_the_earliest_matches() {
+        let dir = tempdir().unwrap();
+        let body: String = (0..8).map(|i| format!("needle_prefix line{i}\n")).collect();
+        fs::write(dir.path().join("ordered.txt"), body).unwrap();
+
+        let mut args = grep_args("needle_prefix");
+        args.max_matches_per_file = Some(3);
+
+        for result in [
+            run_grep_with_rg(dir.path(), &args)
+                .expect("rg path must not error")
+                .expect("rg must be available for this test"),
+            run_grep_native(dir.path(), &args).unwrap(),
+        ] {
+            let lines: Vec<usize> = result.files[0]
+                .matches
+                .iter()
+                .map(|m| m.line_number)
+                .collect();
+            assert_eq!(lines, vec![1, 2, 3]);
+        }
+    }
+
 }
