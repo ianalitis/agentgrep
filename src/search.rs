@@ -169,6 +169,18 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
         follow: !args.no_follow,
     };
     let files = collect_file_entries(&scope);
+    // With a structure budget, lexical matching stays parallel and structure
+    // is attached after results are sorted. Retain only path metadata here so
+    // the second, bounded pass can reopen the real file, including non-UTF-8
+    // paths whose emitted display name contains a disambiguation suffix.
+    let structure_limit = args.max_structure_files.filter(|max| *max < files.len());
+    let entries_by_display = structure_limit.map(|_| {
+        files
+            .iter()
+            .cloned()
+            .map(|entry| (entry.display_path(), entry))
+            .collect::<BTreeMap<_, _>>()
+    });
     let worker_count = thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
@@ -179,7 +191,12 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
 
     if worker_count <= 1 || files.len() <= 8 {
         for entry in files {
-            if let Some(file_matches) = process_file(entry, &matcher, args.max_matches_per_file) {
+            if let Some(file_matches) = process_file(
+                entry,
+                &matcher,
+                args.max_matches_per_file,
+                structure_limit.is_none(),
+            ) {
                 total_matches += file_matches.matches.len();
                 results.push(file_matches);
             }
@@ -194,7 +211,12 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
                     let mut partial = Vec::new();
                     let mut partial_total = 0;
                     for entry in chunk.iter().cloned() {
-                        if let Some(file_matches) = process_file(entry, &matcher, args.max_matches_per_file) {
+                        if let Some(file_matches) = process_file(
+                            entry,
+                            &matcher,
+                            args.max_matches_per_file,
+                            structure_limit.is_none(),
+                        ) {
                             partial_total += file_matches.matches.len();
                             partial.push(file_matches);
                         }
@@ -219,6 +241,10 @@ fn run_grep_native(root: &Path, args: &GrepArgs) -> Result<GrepResult, String> {
     // (disambiguate_display_path appends a byte-derived suffix), so this
     // sort is total and portable.
     results.sort_by(|a, b| a.path.cmp(&b.path));
+
+    if let (Some(max), Some(entries)) = (structure_limit, entries_by_display.as_ref()) {
+        attach_structure_to_prefix(entries, &mut results, max);
+    }
 
     Ok(GrepResult {
         query: args.query.clone(),
@@ -295,9 +321,16 @@ fn run_grep_with_rg(root: &Path, args: &GrepArgs) -> Result<Option<GrepResult>, 
 
     let mut results = Vec::with_capacity(matched_files.len());
     let mut total_matches = 0;
+    // `matched_files` comes from a BTreeMap keyed on the display path, so its
+    // order already matches the final sort. That makes the index a file's
+    // final position, and the structure budget an exact prefix.
+    let wants_structure = |index: usize| args.max_structure_files.is_none_or(|max| index < max);
+
     if worker_count <= 1 || matched_files.len() <= 8 {
-        for (path, matches) in matched_files {
-            if let Some(file_matches) = process_rg_match_file(root, path, matches) {
+        for (index, (path, matches)) in matched_files.into_iter().enumerate() {
+            if let Some(file_matches) =
+                process_rg_match_file(root, path, matches, wants_structure(index))
+            {
                 total_matches += file_matches.matches.len();
                 results.push(file_matches);
             }
@@ -306,12 +339,18 @@ fn run_grep_with_rg(root: &Path, args: &GrepArgs) -> Result<Option<GrepResult>, 
         let chunk_size = matched_files.len().div_ceil(worker_count);
         let partials = thread::scope(|scope| {
             let mut handles = Vec::new();
-            for chunk in matched_files.chunks(chunk_size) {
+            for (chunk_index, chunk) in matched_files.chunks(chunk_size).enumerate() {
+                let chunk_start = chunk_index * chunk_size;
                 handles.push(scope.spawn(move || {
                     let mut partial = Vec::new();
                     let mut partial_total = 0;
-                    for (path, matches) in chunk.iter().cloned() {
-                        if let Some(file_matches) = process_rg_match_file(root, path, matches) {
+                    for (offset, (path, matches)) in chunk.iter().cloned().enumerate() {
+                        if let Some(file_matches) = process_rg_match_file(
+                            root,
+                            path,
+                            matches,
+                            wants_structure(chunk_start + offset),
+                        ) {
                             partial_total += file_matches.matches.len();
                             partial.push(file_matches);
                         }
@@ -730,10 +769,47 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Attach symbol structure to the first `max` matched files, in final result
+/// order, while retaining their real filesystem paths.
+///
+/// The native fallback first scans all candidate files in parallel without
+/// structure work, sorts the matches, then reopens only this bounded prefix.
+/// `entries_by_display` preserves the true path for non-UTF-8 filenames whose
+/// emitted display path contains a disambiguation suffix and cannot itself be
+/// joined back onto the root.
+fn attach_structure_to_prefix(
+    entries_by_display: &BTreeMap<String, crate::workspace::FileEntry>,
+    results: &mut [FileMatches],
+    max: usize,
+) {
+    for file in results.iter_mut().take(max) {
+        // Dense-match files intentionally carry no structure; leave them alone.
+        if file.matches.len() >= DENSE_MATCH_SKIP_STRUCTURE_THRESHOLD {
+            continue;
+        }
+        let Some(entry) = entries_by_display.get(&file.path) else {
+            continue;
+        };
+        let Some(text) = read_text_file(&entry.path) else {
+            continue;
+        };
+        let structure = extract_file_structure(&entry.path, &entry.relative_path, &text);
+        let grouping = group_matches(&structure.items, &file.matches);
+        file.language = structure.language;
+        file.role = structure.role;
+        file.groups = grouping.groups;
+        file.total_symbols = structure.items.len();
+        file.matched_symbol_count = grouping.matched_symbol_count;
+        file.other_symbols = grouping.other_symbols;
+        file.other_symbols_omitted_count = grouping.other_symbols_omitted_count;
+    }
+}
+
 fn process_rg_match_file(
     root: &Path,
     path: RgPathKey,
     matches: Vec<LineMatch>,
+    extract_structure: bool,
 ) -> Option<FileMatches> {
     let absolute_path = path.to_absolute(root);
     // Role/structure inference uses the plain lossy path; the emitted `path`
@@ -741,7 +817,9 @@ fn process_rg_match_file(
     let lossy_path = path.display.clone();
     let display_path = path.display_path();
     let path_bytes = path.path_bytes_hex();
-    if matches.len() >= DENSE_MATCH_SKIP_STRUCTURE_THRESHOLD {
+    // Files past the structure budget are emitted with their matches but
+    // without symbol grouping, the same shape used for dense-match files.
+    if !extract_structure || matches.len() >= DENSE_MATCH_SKIP_STRUCTURE_THRESHOLD {
         return Some(build_dense_file_matches(
             display_path,
             path_bytes,
@@ -801,6 +879,7 @@ fn process_file(
     entry: crate::workspace::FileEntry,
     matcher: &Matcher,
     max_matches_per_file: Option<usize>,
+    extract_structure: bool,
 ) -> Option<FileMatches> {
     let text = read_text_file(&entry.path)?;
 
@@ -823,7 +902,7 @@ fn process_file(
         return None;
     }
 
-    if matches.len() >= DENSE_MATCH_SKIP_STRUCTURE_THRESHOLD {
+    if !extract_structure || matches.len() >= DENSE_MATCH_SKIP_STRUCTURE_THRESHOLD {
         return Some(build_dense_file_matches(
             entry.display_path(),
             entry.path_bytes_hex(),
@@ -1117,6 +1196,7 @@ mod tests {
             glob: None,
             no_follow: false,
             max_matches_per_file: None,
+            max_structure_files: None,
         }
     }
 
@@ -2068,11 +2148,7 @@ mod tests {
         let dir = tempdir().unwrap();
         // 10 matches in one file, 3 in another: enough to prove the cap binds
         // per file rather than globally.
-        fs::write(
-            dir.path().join("many.txt"),
-            "needle_cap\n".repeat(10),
-        )
-        .unwrap();
+        fs::write(dir.path().join("many.txt"), "needle_cap\n".repeat(10)).unwrap();
         fs::write(dir.path().join("few.txt"), "needle_cap\n".repeat(3)).unwrap();
 
         let mut args = grep_args("needle_cap");
@@ -2145,4 +2221,133 @@ mod tests {
         }
     }
 
+    fn structured_paths(result: &GrepResult) -> Vec<String> {
+        result
+            .files
+            .iter()
+            .filter(|file| file.total_symbols > 0)
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    fn top_n_corpus() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            let function = name.trim_end_matches(".rs");
+            fs::write(
+                dir.path().join(name),
+                format!("fn {function}() {{ let _ = \"needle_top_n\"; }}\n"),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// Both engines must attach structure to exactly the first N matched files
+    /// in final result order, while preserving every file and match.
+    #[test]
+    fn max_structure_files_gates_the_exact_result_prefix() {
+        let dir = top_n_corpus();
+        let mut args = grep_args("needle_top_n");
+        args.max_structure_files = Some(2);
+
+        let rg_result = run_grep_with_rg(dir.path(), &args)
+            .expect("rg path must not error")
+            .expect("rg must be available for this test");
+        let native_result = run_grep_native(dir.path(), &args).unwrap();
+
+        for result in [&rg_result, &native_result] {
+            assert_eq!(result.total_files, 4);
+            assert_eq!(result.total_matches, 4);
+            assert_eq!(
+                result
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a.rs", "b.rs", "c.rs", "d.rs"]
+            );
+            assert_eq!(structured_paths(result), vec!["a.rs", "b.rs"]);
+            assert_eq!(result.files[2].matches.len(), 1);
+            assert_eq!(result.files[3].matches.len(), 1);
+        }
+
+        assert_eq!(
+            structured_paths(&rg_result),
+            structured_paths(&native_result)
+        );
+    }
+
+    /// The budget is counted over matched files, not candidate files. Earlier
+    /// files with no match must not consume it on the native fallback.
+    #[test]
+    fn unmatched_candidates_do_not_consume_structure_budget() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a_no.rs"), "fn a_no() {}\n").unwrap();
+        fs::write(dir.path().join("b_no.rs"), "fn b_no() {}\n").unwrap();
+        fs::write(
+            dir.path().join("c_yes.rs"),
+            "fn c_yes() { let _ = \"needle_rank\"; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("d_yes.rs"),
+            "fn d_yes() { let _ = \"needle_rank\"; }\n",
+        )
+        .unwrap();
+
+        let mut args = grep_args("needle_rank");
+        args.max_structure_files = Some(1);
+
+        let rg_result = run_grep_with_rg(dir.path(), &args)
+            .expect("rg path must not error")
+            .expect("rg must be available for this test");
+        let native_result = run_grep_native(dir.path(), &args).unwrap();
+
+        assert_eq!(structured_paths(&rg_result), vec!["c_yes.rs"]);
+        assert_eq!(structured_paths(&native_result), vec!["c_yes.rs"]);
+        assert_eq!(rg_result.total_matches, 2);
+        assert_eq!(native_result.total_matches, 2);
+    }
+
+    /// A zero structure budget remains a complete lexical search: only symbol
+    /// metadata is omitted.
+    #[test]
+    fn zero_structure_budget_preserves_files_and_matches() {
+        let dir = top_n_corpus();
+        let mut args = grep_args("needle_top_n");
+        args.max_structure_files = Some(0);
+
+        for result in [
+            run_grep_with_rg(dir.path(), &args)
+                .expect("rg path must not error")
+                .expect("rg must be available for this test"),
+            run_grep_native(dir.path(), &args).unwrap(),
+        ] {
+            assert_eq!(result.total_files, 4);
+            assert_eq!(result.total_matches, 4);
+            assert!(structured_paths(&result).is_empty());
+            assert!(result.files.iter().all(|file| file.matches.len() == 1));
+        }
+    }
+
+    /// Leaving the gate unset preserves the existing full-structure behavior.
+    #[test]
+    fn structure_gate_unset_preserves_full_structure() {
+        let dir = top_n_corpus();
+        let args = grep_args("needle_top_n");
+        assert_eq!(args.max_structure_files, None);
+
+        for result in [
+            run_grep_with_rg(dir.path(), &args)
+                .expect("rg path must not error")
+                .expect("rg must be available for this test"),
+            run_grep_native(dir.path(), &args).unwrap(),
+        ] {
+            assert_eq!(
+                structured_paths(&result),
+                vec!["a.rs", "b.rs", "c.rs", "d.rs"]
+            );
+        }
+    }
 }

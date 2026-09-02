@@ -72,6 +72,22 @@ pub struct GrepArgs {
     #[arg(long = "max-count")]
     pub max_matches_per_file: Option<usize>,
 
+    /// Extract per-file structure (symbols, grouping) for at most this many
+    /// files, in result order.
+    ///
+    /// Structure extraction re-reads and parses each matched file, costing
+    /// ~26us/file. Consumers that render only a bounded prefix of results pay
+    /// that for every match: a query hitting 625 files does 625 extractions
+    /// even when the renderer stops after a fraction of them. Files past the
+    /// bound still appear with their matches, just without symbol grouping,
+    /// exactly like files over the dense-match threshold.
+    ///
+    /// Results are ordered by display path before this is applied, so the
+    /// gated prefix is deterministic and matches what a path-ordered renderer
+    /// shows first. Leave unset to extract structure for every matched file.
+    #[arg(long = "max-structure-files")]
+    pub max_structure_files: Option<usize>,
+
     /// Optional root path to search instead of the current directory.
     #[arg(long)]
     pub path: Option<String>,

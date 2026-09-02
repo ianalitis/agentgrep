@@ -487,6 +487,7 @@ mod tests {
             glob: None,
             no_follow: false,
             max_matches_per_file: None,
+            max_structure_files: None,
         }
     }
 

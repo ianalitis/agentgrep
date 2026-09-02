@@ -110,6 +110,7 @@ fn grep_args(query: &str) -> GrepArgs {
         path: None,
         glob: None,
         max_matches_per_file: None,
+        max_structure_files: None,
     }
 }
 
