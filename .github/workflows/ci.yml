@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+  check-macos:
+    name: Check (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # APFS refuses to create a file name that is not valid UTF-8, failing with
+      # EILSEQ (errno 92, surfaced as "Illegal byte sequence"), so the tests that
+      # build a non-UTF-8 corpus cannot run here at all. That family is
+      # `tests/nonutf8_adversarial_probe.rs` and `tests/nonutf8_collision.rs`
+      # (excluded by selecting `--lib --bins`) plus the five library tests named
+      # below. They are meaningful on Linux and run in the job above, so this leg
+      # covers everything that is runnable on macOS rather than skipping the OS.
+      - name: Test (everything that does not need non-UTF-8 file names)
+        run: |
+          cargo test --all-features --lib --bins -- \
+            --skip outline_context_keys_on_disambiguated_path_for_non_utf8_names \
+            --skip glob_question_mark_matches_non_utf8_byte \
+            --skip grep_rg_and_native_agree_on_non_utf8_corpus \
+            --skip collect_file_entries_sorted_by_native_bytes_regardless_of_creation_order \
+            --skip glob_and_type_filters_match_raw_bytes_not_lossy_display
