@@ -46,15 +46,15 @@ pub fn render_grep_output(
         render_grep_file(file, args, &mut lines, &mut state);
     }
 
-    if let Some(max) = max_matches {
-        if result.total_matches > state.displayed_matches {
-            lines.push(String::new());
-            lines.push(format!(
-                "... {} more matches omitted (max_regions={})",
-                result.total_matches.saturating_sub(state.displayed_matches),
-                max
-            ));
-        }
+    if let Some(max) = max_matches
+        && result.total_matches > state.displayed_matches
+    {
+        lines.push(String::new());
+        lines.push(format!(
+            "... {} more matches omitted (max_regions={})",
+            result.total_matches.saturating_sub(state.displayed_matches),
+            max
+        ));
     }
 
     lines.join("\n")
@@ -192,9 +192,7 @@ pub fn compact_rendered_match_line(line: &str, args: &GrepArgs) -> String {
         return line.to_string();
     }
 
-    let match_start_char = if args.regex {
-        0
-    } else if args.query.is_empty() {
+    let match_start_char = if args.regex || args.query.is_empty() {
         0
     } else {
         line.find(&args.query)
