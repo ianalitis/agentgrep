@@ -152,7 +152,7 @@ fn resolve_display_disambiguated_path(root: &Path, requested: &str) -> Option<Pa
     exact.or(if lossy_ambiguous { None } else { lossy })
 }
 
-fn file_not_found_error(root: &Path, requested: &str, resolved: &PathBuf) -> String {
+fn file_not_found_error(root: &Path, requested: &str, resolved: &Path) -> String {
     let mut message = format!("file not found: {}", resolved.display());
     let suggestions = suggest_similar_files(root, requested);
     if !suggestions.is_empty() {
